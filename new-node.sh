@@ -59,10 +59,10 @@ ok()   { printf '    \033[1;32m✓\033[0m %s\n' "$*"; }
 warn() { printf '    \033[1;33m!\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[1;31mОШИБКА: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Терминал есть? При запуске через `ssh host 'bash script'` (без -t) его нет,
-# и любой read молча провалится — поэтому спрашиваем только когда можем.
+# Терминал открываем ОДИН раз на fd 3 и читаем только оттуда. Иначе при
+# `bash <(curl …)` повторное `read </dev/tty` ловит EOF и вопросы срываются.
 HAVE_TTY=0
-[ -e /dev/tty ] && { : </dev/tty; } 2>/dev/null && HAVE_TTY=1
+if [ -e /dev/tty ] && exec 3</dev/tty 2>/dev/null; then HAVE_TTY=1; fi
 
 ask() { # ask "вопрос" "значение-по-умолчанию"
   local q="$1" def="${2:-}" a
@@ -71,9 +71,9 @@ ask() { # ask "вопрос" "значение-по-умолчанию"
     [ -n "$def" ] && { echo "$def"; return; }
     die "нет терминала для вопроса «$q» — передай значение аргументом или запусти через ssh -t"
   fi
-  if [ -n "$def" ]; then read -r -p "$q [$def]: " a </dev/tty; echo "${a:-$def}"
+  if [ -n "$def" ]; then printf '%s [%s]: ' "$q" "$def" >&2; read -r a <&3; echo "${a:-$def}"
   else
-    while :; do read -r -p "$q: " a </dev/tty; [ -n "$a" ] && break; done
+    while :; do printf '%s: ' "$q" >&2; read -r a <&3; [ -n "$a" ] && break; done
     echo "$a"
   fi
 }
@@ -81,8 +81,8 @@ ask() { # ask "вопрос" "значение-по-умолчанию"
 confirm() { # confirm "вопрос" -> 0 да / 1 нет; без терминала считаем «да»
   [ "$ASSUME_YES" = 1 ] && return 0
   [ "$HAVE_TTY" = 0 ] && { warn "нет терминала — считаю ответ утвердительным"; return 0; }
-  local a; read -r -p "$1 [y/N]: " a </dev/tty
-  case "$a" in y|Y|yes|YES|да) return 0;; *) return 1;; esac
+  local a; printf '%s [y/N]: ' "$1" >&2; read -r a <&3 || a=""
+  case "$a" in y|Y|yes|YES|да|Да|ДА) return 0;; *) return 1;; esac
 }
 
 while [ $# -gt 0 ]; do

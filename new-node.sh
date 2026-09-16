@@ -114,18 +114,21 @@ esac
 ### --- параметры ---------------------------------------------------------- ###
 if [ -z "$TYPE" ]; then
   echo
-  c "Тип ноды:"
-  echo "  1) cdn        — за российским CDN (как Польша/Германия LTE)"
-  echo "  2) selfsteal  — прямая Reality с маскировкой под свой сайт"
-  echo "  3) reality    — простая Reality на 443, без сайта и сертификата (быстро)"
-  echo "  4) hysteria   — Hysteria2 (UDP 443), нужен сертификат на домен"
-  case "$(ask 'Выбери 1-4' '1')" in
-    1|cdn) TYPE="cdn";;
+  c "Какую ноду поднимаем? Выбери цифру:"
+  echo
+  echo "  1) VLESS Reality           — простая, на 443, без сайта и сертификата (самая быстрая)"
+  echo "  2) VLESS Reality + свой сайт — маскировка под собственный сайт (self-steal)"
+  echo "  3) YCDN / LTE              — за российским CDN (Yandex/VK), как Польша/Германия LTE"
+  echo "  4) Hysteria2              — UDP 443, с сертификатом на домен"
+  echo
+  case "$(ask 'Твой выбор (1-4)' '1')" in
+    1|reality)   TYPE="reality";;
     2|selfsteal) TYPE="selfsteal";;
-    3|reality) TYPE="reality";;
-    4|hysteria) TYPE="hysteria";;
+    3|cdn|ycdn)  TYPE="cdn";;
+    4|hysteria)  TYPE="hysteria";;
     *) die "непонятный выбор";;
   esac
+  ok "выбрано: $TYPE"
 fi
 case "$TYPE" in cdn|selfsteal|reality|hysteria) ;; *) die "--type: cdn | selfsteal | reality | hysteria";; esac
 

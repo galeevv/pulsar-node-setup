@@ -711,6 +711,24 @@ if [ "$TYPE" = "reality" ]; then
   fi
 fi
 
+### --- 10.7 генерация ключей Reality ------------------------------------- ###
+# Для reality/selfsteal нужны СВОИ x25519-ключи и shortId на КАЖДУЮ ноду.
+# Генерим прямо в контейнере (ядро то же, что будет работать) и печатаем.
+REALITY_PRIV=""; REALITY_PUB=""; SHORT_ID=""
+if [ "$TYPE" = "reality" ] || [ "$TYPE" = "selfsteal" ]; then
+  log "Генерирую ключи Reality (свои для этой ноды)"
+  kp="$(docker exec remnanode xray x25519 2>/dev/null || true)"
+  REALITY_PRIV="$(printf '%s\n' "$kp" | awk -F': ' '/PrivateKey|Private key/{print $2; exit}')"
+  REALITY_PUB="$(printf '%s\n' "$kp" | awk -F': ' '/Password|Public key|PublicKey/{print $2; exit}')"
+  SHORT_ID="$(openssl rand -hex 8)"
+  if [ -n "$REALITY_PRIV" ] && [ -n "$REALITY_PUB" ]; then
+    ok "ключи сгенерированы"
+  else
+    warn "не удалось сгенерировать через контейнер — сгенери вручную:"
+    warn "  docker exec remnanode xray x25519   и   openssl rand -hex 8"
+  fi
+fi
+
 ### --- 11. проверки и итог ---------------------------------------------- ###
 log "Проверки"
 case "$TYPE" in
@@ -767,7 +785,78 @@ esac)
   3) Host — адрес подключения клиента, fingerprint edge.
   4) Добавь inbound в сквод — ИНАЧЕ панель не отдаст его на ноду и порт
      $([ "$TYPE" = cdn ] && echo "$XRAY_PORT" || echo 443) не откроется.
-
-Reality-ноды: КАЖДОЙ свои x25519-ключи и свой dest (общий конфиг → бан пачкой).
 ────────────────────────────────────────────────────────────────────────
 EOF
+
+# --- готовые значения и JSON для панели -----------------------------------
+if [ "$TYPE" = "reality" ]; then
+  cat <<EOF
+
+════════════════ ДАННЫЕ ДЛЯ ПАНЕЛИ (VLESS Reality) ════════════════════════
+  privateKey (в inbound) : $REALITY_PRIV
+  publicKey  (клиентам/pbk): $REALITY_PUB
+  shortId                : $SHORT_ID
+  dest / serverName      : $SNI
+  адрес подключения (Host): $MYIP : 443, fingerprint edge
+
+── JSON инбаунда (вставь в Config Profile → inbound, ключи уже подставлены) ──
+{
+  "tag": "REALITY_$(echo "$DOMAIN" | tr '.:' '__')",
+  "listen": "0.0.0.0",
+  "port": 443,
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "streamSettings": {
+    "network": "raw",
+    "security": "reality",
+    "realitySettings": {
+      "dest": "$SNI:443",
+      "show": false,
+      "xver": 0,
+      "serverNames": ["$SNI"],
+      "privateKey": "$REALITY_PRIV",
+      "shortIds": ["$SHORT_ID"]
+    }
+  },
+  "sniffing": { "enabled": false }
+}
+═══════════════════════════════════════════════════════════════════════════
+EOF
+elif [ "$TYPE" = "selfsteal" ]; then
+  cat <<EOF
+
+════════════════ ДАННЫЕ ДЛЯ ПАНЕЛИ (VLESS Reality self-steal) ═════════════
+  privateKey (в inbound) : $REALITY_PRIV
+  publicKey  (клиентам/pbk): $REALITY_PUB
+  shortId                : $SHORT_ID
+  serverName / SNI       : $DOMAIN
+  Reality target         : 127.0.0.1:$SELFSTEAL_SITE_PORT (локальный сайт)
+  адрес подключения (Host): $DOMAIN : 443, fingerprint edge
+
+── JSON инбаунда (транспорт raw; xhttp можно включить в панели позже) ──────
+{
+  "tag": "SELFSTEAL_$(echo "$DOMAIN" | tr '.:' '__')",
+  "listen": "0.0.0.0",
+  "port": 443,
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "streamSettings": {
+    "network": "raw",
+    "security": "reality",
+    "realitySettings": {
+      "target": "127.0.0.1:$SELFSTEAL_SITE_PORT",
+      "show": false,
+      "xver": 0,
+      "serverNames": ["$DOMAIN"],
+      "privateKey": "$REALITY_PRIV",
+      "shortIds": ["$SHORT_ID"]
+    }
+  },
+  "sniffing": { "enabled": false }
+}
+═══════════════════════════════════════════════════════════════════════════
+EOF
+fi
+
+echo
+warn "privateKey — секрет: он остаётся только в панели, клиентам идёт publicKey."

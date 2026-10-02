@@ -60,21 +60,32 @@ echo "всего ключей у root: $KEYS_COUNT"
 ### 2. sshd: пускать по ключу, root — только по ключу --------------------- ###
 log "Проверяю конфиг sshd"
 install -d -m 755 /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/10-pulsar.conf <<'EOF'
-PubkeyAuthentication yes
-PermitRootLogin prohibit-password
-EOF
+SSH_CONFIG=/etc/ssh/sshd_config.d/10-pulsar.conf
+SSH_BACKUP=$(mktemp)
+had_config=0
+if [ -f "$SSH_CONFIG" ]; then cp -p "$SSH_CONFIG" "$SSH_BACKUP"; had_config=1; fi
+if ! grep -q '^PubkeyAuthentication yes$' "$SSH_CONFIG" 2>/dev/null; then
+  printf '\nPubkeyAuthentication yes\n' >> "$SSH_CONFIG"
+fi
 if [ "$HARDEN" = 1 ]; then
   [ "$KEYS_COUNT" -ge 1 ] || die "нет ни одного ключа — не выключаю пароли, иначе останешься без доступа."
-  cat >> /etc/ssh/sshd_config.d/10-pulsar.conf <<'EOF'
+  previous=$(cat "$SSH_CONFIG")
+  cat > "$SSH_CONFIG" <<'EOF'
+PermitRootLogin prohibit-password
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 EOF
+  printf '%s\n' "$previous" >> "$SSH_CONFIG"
   echo "вход по паролю ВЫКЛЮЧЕН (--harden)"
 else
   echo "вход по паролю оставлен как был (запусти с --harden позже, когда убедишься, что ключи работают)"
 fi
-sshd -t || die "sshd -t не прошёл, конфиг не применён — правь /etc/ssh/sshd_config.d/10-pulsar.conf"
+if ! sshd -t; then
+  if [ "$had_config" = 1 ]; then cp -p "$SSH_BACKUP" "$SSH_CONFIG"; else rm -f "$SSH_CONFIG"; fi
+  rm -f "$SSH_BACKUP"
+  die "sshd -t не прошёл; предыдущая конфигурация восстановлена."
+fi
+rm -f "$SSH_BACKUP"
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart ssh
 echo "sshd перезагружен"
 

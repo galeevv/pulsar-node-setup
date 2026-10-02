@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # Подготовка НОВОЙ НОДЫ для Remnawave. Запускать НА САМОЙ НОДЕ под root.
-# Ubuntu 24.04. Идемпотентный: повторный запуск дописывает недоделанное.
+# Ubuntu 24.04. Повторный запуск использует сохранённые параметры и ключи.
 #
 # Скрипт готовит только САМУ НОДУ (пакеты, сеть, docker, nginx/сертификат
 # по типу, remnanode). Профиль/инбаунд/хост/сквод настраиваются В ПАНЕЛИ —
@@ -40,7 +40,9 @@
 # памяти контейнеру), ufw, для нужных типов — сайт-прикрытие и Let's Encrypt
 # с автопродлением, nginx под тип, remnanode.
 # ---------------------------------------------------------------------------
+set +x  # Never trace secrets, even when invoked with bash -x.
 set -Eeuo pipefail
+umask 077
 export DEBIAN_FRONTEND=noninteractive
 
 PANEL_IP_DEFAULT=""                       # задаётся --panel-ip или интерактивно
@@ -48,6 +50,11 @@ XRAY_PORT_DEFAULT_CDN=4444
 SELFSTEAL_SITE_PORT=8443
 NODE_IMAGE_DEFAULT="remnawave/node:latest"
 NODE_PORT_DEFAULT=2222
+STATE_DIR="${PULSAR_SETUP_DIR:-/opt/pulsar-node-setup}"
+NODE_DIR="${PULSAR_NODE_DIR:-/opt/remnanode}"
+SECRET_KEY_FILE=""; SECRET_KEY=""; PLAN=0; UPGRADE=0
+STEP="параметры"
+trap 'printf "\nОшибка на этапе: %s (строка %s). Повторите ту же команду после исправления.\n" "$STEP" "$LINENO" >&2' ERR
 
 TYPE=""; DOMAIN=""; CDN_DOMAIN=""; TUNNEL_PATH=""; XRAY_PORT=""; SNI=""
 PANEL_IP="$PANEL_IP_DEFAULT"; ASSUME_YES=0; HARDEN=0
@@ -59,34 +66,138 @@ ok()   { printf '    \033[1;32m✓\033[0m %s\n' "$*"; }
 warn() { printf '    \033[1;33m!\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[1;31mОШИБКА: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Терминал открываем ОДИН раз на fd 3 и читаем только оттуда. Иначе при
-# `bash <(curl …)` повторное `read </dev/tty` ловит EOF и вопросы срываются.
+# A dedicated terminal also works for curl | bash; EOF is never approval.
 HAVE_TTY=0
-if [ -e /dev/tty ] && exec 3</dev/tty 2>/dev/null; then HAVE_TTY=1; fi
-
-ask() { # ask "вопрос" "значение-по-умолчанию"
+if { exec 3</dev/tty; } 2>/dev/null; then HAVE_TTY=1; fi
+ask() {
   local q="$1" def="${2:-}" a
-  if [ "$ASSUME_YES" = 1 ] && [ -n "$def" ]; then echo "$def"; return; fi
-  if [ "$HAVE_TTY" = 0 ]; then
-    [ -n "$def" ] && { echo "$def"; return; }
-    die "нет терминала для вопроса «$q» — передай значение аргументом или запусти через ssh -t"
+  if [ "$ASSUME_YES" = 1 ] || [ "$HAVE_TTY" = 0 ]; then
+    [ -n "$def" ] || die "Не задано: $q. Передайте соответствующий флаг (см. --help)."
+    printf '%s\n' "$def"; return
   fi
-  if [ -n "$def" ]; then printf '%s [%s]: ' "$q" "$def" >&2; read -r a <&3; echo "${a:-$def}"
-  else
-    while :; do printf '%s: ' "$q" >&2; read -r a <&3; [ -n "$a" ] && break; done
-    echo "$a"
-  fi
+  while :; do
+    printf '%s%s: ' "$q" "${def:+ [$def]}" >&2
+    read -r a <&3 || die "Ввод прерван."
+    a="${a:-$def}"
+    [ -n "$a" ] && { printf '%s\n' "$a"; return; }
+  done
 }
-
-confirm() { # confirm "вопрос" -> 0 да / 1 нет; без терминала считаем «да»
+confirm() {
   [ "$ASSUME_YES" = 1 ] && return 0
-  [ "$HAVE_TTY" = 0 ] && { warn "нет терминала — считаю ответ утвердительным"; return 0; }
-  local a; printf '%s [y/N]: ' "$1" >&2; read -r a <&3 || a=""
-  case "$a" in y|Y|yes|YES|да|Да|ДА) return 0;; *) return 1;; esac
+  [ "$HAVE_TTY" = 1 ] || die "Нет терминала. Проверьте --plan, затем используйте --yes."
+  local a
+  printf '%s [y/N]: ' "$1" >&2
+  read -r a <&3 || return 1
+  case "$a" in y|Y|yes|да|Да) return 0;; *) return 1;; esac
 }
+help() {
+  cat <<'EOF'
+Мастер подготовки Remnawave-ноды (Ubuntu 24.04). Запускать НА НОДЕ.
+  bash new-node.sh                         интерактивный мастер
+  bash new-node.sh --plan [параметры]       показать план, ничего не менять
+  bash new-node.sh --yes [все параметры]    установка без вопросов
 
+Типы: --type reality | selfsteal | cdn | hysteria
+  reality   RAW Reality, без nginx и сертификата
+  selfsteal XHTTP Reality, свой TLS-сайт на 127.0.0.1:8443
+  cdn       XHTTP через CDN; nginx 443 → Xray 127.0.0.1:4444
+  hysteria  Hysteria2, UDP 443, сертификат на домен
+
+Общие: --panel-ip IPv4 --domain ДОМЕН
+Ключ:  --secret-key-file /root/node-secret.txt (только значение Secret Key)
+       Без флага мастер предложит скрытый ввод. Существующий .env сохраняется.
+CDN:   --cdn-domain ДОМЕН --path /content/gallery/preview/ --port 4444
+Reality: --sni www.icloud.com
+Другие: --node-port 2222 --node-image remnawave/node:VERSION --mem-limit 1500m
+        --upgrade-packages (полное apt upgrade, по умолчанию выключено)
+        --harden (только после проверки входа по SSH-ключу)
+
+Порядок: параметры → Secret Key → проверка → установка → инструкция для панели.
+Параметры сохраняются в /opt/pulsar-node-setup/settings.tsv; повторный запуск
+использует их. Смена типа/домена существующей ноды требует отдельной миграции.
+Скрипт НЕ создаёт профиль/Host/сквод и НЕ переоборудует работающую ноду.
+EOF
+}
+valid_domain() {
+  local label
+  [[ "$1" =~ ^[a-zA-Z0-9.-]+$ && "$1" == *.* && ${#1} -le 253 ]] || return 1
+  local IFS=.; local -a labels
+  read -ra labels <<< "$1"
+  [[ "$1" != *. ]] || return 1
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 && "$label" != -* && "$label" != *- ]] || return 1
+  done
+}
+valid_ip() {
+  local part; local -a parts
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  local IFS=.; read -ra parts <<< "$1"
+  for part in "${parts[@]}"; do
+    [[ "$part" == 0 || "$part" != 0* ]] || return 1
+    [[ ${#part} -le 3 ]] && ((10#$part <= 255)) || return 1
+  done
+}
+valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && ((10#$1 < 65536)); }
+load_settings() {
+  [ -f "$STATE_DIR/settings.tsv" ] || return 0
+  local key value
+  while IFS=$'\t' read -r key value; do
+    case "$key" in TYPE|DOMAIN|CDN_DOMAIN|TUNNEL_PATH|XRAY_PORT|SNI|PANEL_IP|NODE_IMAGE|NODE_PORT|MEM_LIMIT)
+      printf -v "$key" '%s' "$value";;
+    esac
+  done < "$STATE_DIR/settings.tsv"
+}
+save_settings() {
+  install -d -m 700 "$STATE_DIR"
+  local key tmp; tmp=$(mktemp "$STATE_DIR/settings.XXXXXX")
+  for key in TYPE DOMAIN CDN_DOMAIN TUNNEL_PATH XRAY_PORT SNI PANEL_IP NODE_IMAGE NODE_PORT MEM_LIMIT; do
+    printf '%s\t%s\n' "$key" "${!key}"
+  done > "$tmp"
+  chmod 600 "$tmp"; mv "$tmp" "$STATE_DIR/settings.tsv"
+}
+read_secret() {
+  if [ -n "$SECRET_KEY_FILE" ]; then
+    [ -r "$SECRET_KEY_FILE" ] || die "Не читается файл Secret Key."
+    SECRET_KEY=$(cat "$SECRET_KEY_FILE")
+    SECRET_KEY="${SECRET_KEY%$'\r'}"
+  elif [ -f "$NODE_DIR/.env" ]; then
+    # Read literal data, never source an env file as shell code.
+    SECRET_KEY=$(sed -n 's/^SECRET_KEY=//p' "$NODE_DIR/.env")
+    SECRET_KEY="${SECRET_KEY%$'\r'}"
+    if [[ "$SECRET_KEY" == \"*\" || "$SECRET_KEY" == \'*\' ]]; then SECRET_KEY="${SECRET_KEY:1:${#SECRET_KEY}-2}"; fi
+  fi
+  if [ -z "$SECRET_KEY" ]; then
+    [ "$ASSUME_YES" = 0 ] && [ "$HAVE_TTY" = 1 ] || die "Нужен --secret-key-file или существующий $NODE_DIR/.env."
+    printf '\nВ панели Remnawave откройте установку ноды и скопируйте значение Secret Key.\nНе API token и не Reality privateKey. Вставьте одну строку, затем Enter.\n' >&2
+    read -r -s -p 'Secret Key (ввод скрыт): ' SECRET_KEY <&3 || die "Ввод ключа прерван."
+    printf '\n' >&2
+  fi
+  [[ "$SECRET_KEY" =~ ^[a-zA-Z0-9_+/=-]+$ ]] || die "Secret Key пуст или содержит пробелы/неподдерживаемые символы. Нужна только строка значения."
+}
+write_secret() {
+  install -d -m 700 "$NODE_DIR"
+  local tmp; tmp=$(mktemp "$NODE_DIR/.env.XXXXXX")
+  if [ -f "$NODE_DIR/.env" ]; then
+    sed '/^SECRET_KEY=/d; /^NODE_PORT=/d' "$NODE_DIR/.env" > "$tmp"
+    printf '\n' >> "$tmp"
+  fi
+  printf 'NODE_PORT=%s\nSECRET_KEY=%s\n' "$NODE_PORT" "$SECRET_KEY" >> "$tmp"
+  chmod 600 "$tmp"; mv "$tmp" "$NODE_DIR/.env"
+  unset SECRET_KEY
+}
+# Tests can source helpers without touching the host.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
+load_settings
+PREVIOUS_TYPE="$TYPE"; PREVIOUS_DOMAIN="$DOMAIN"
 while [ $# -gt 0 ]; do
   case "$1" in
+    --type|--domain|--cdn-domain|--path|--port|--sni|--panel-ip|--node-image|--node-port|--mem-limit|--secret-key-file)
+      [ $# -ge 2 ] && [[ "$2" != --* ]] || die "Для $1 нужно значение.";;
+  esac
+  case "$1" in
+    --secret-key-file) SECRET_KEY_FILE="$2"; shift 2;;
+    --plan) PLAN=1; shift;;
+    --upgrade-packages) UPGRADE=1; shift;;
     --type)       TYPE="$2"; shift 2;;
     --domain)     DOMAIN="$2"; shift 2;;
     --cdn-domain) CDN_DOMAIN="$2"; shift 2;;
@@ -99,17 +210,10 @@ while [ $# -gt 0 ]; do
     --mem-limit)  MEM_LIMIT="$2"; shift 2;;
     --harden)     HARDEN=1; shift;;
     --yes|-y)     ASSUME_YES=1; shift;;
-    -h|--help)    sed -n '2,45p' "$0"; exit 0;;
+    -h|--help)    help; exit 0;;
     *)            die "неизвестный аргумент: $1";;
   esac
 done
-
-[ "$(id -u)" -eq 0 ] || die "запусти под root"
-. /etc/os-release 2>/dev/null || true
-case "${VERSION_ID:-}" in
-  24.04) ;;
-  *) warn "скрипт писался под Ubuntu 24.04, у тебя ${PRETTY_NAME:-неизвестно} — продолжаю, но проверяй вывод";;
-esac
 
 ### --- параметры ---------------------------------------------------------- ###
 if [ -z "$TYPE" ]; then
@@ -141,7 +245,8 @@ case "$TYPE" in
   hysteria)  NEEDS_CERT=1;;                         # серт есть, nginx нет
 esac
 
-MYIP="$(curl -fsS -4 --max-time 8 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
+MYIP="(будет определён при установке)"
+log "Шаг 1/7 — параметры ноды (до изменений системы)"
 ok "публичный IP этой ноды: $MYIP"
 
 # IP панели нужен всем — ufw откроет ей порт управления.
@@ -175,6 +280,24 @@ else   # reality
   XRAY_PORT=443
 fi
 
+valid_ip "$PANEL_IP" || die "IP панели должен быть корректным IPv4."
+valid_domain "$DOMAIN" || die "Некорректный домен (без https://, пути и порта)."
+[ -z "$CDN_DOMAIN" ] || valid_domain "$CDN_DOMAIN" || die "Некорректный CDN-домен."
+[ -z "$SNI" ] || valid_domain "$SNI" || die "Некорректный SNI."
+valid_port "$NODE_PORT" && valid_port "$XRAY_PORT" || die "Порт должен быть от 1 до 65535."
+[[ "$NODE_PORT" != "$XRAY_PORT" && "$NODE_PORT" != 22 && "$NODE_PORT" != 80 && "$NODE_PORT" != 443 && "$NODE_PORT" != 8443 ]] || die "Порт управления конфликтует с другим сервисом."
+if [ "$TYPE" = cdn ]; then
+  [[ "$XRAY_PORT" != 22 && "$XRAY_PORT" != 80 && "$XRAY_PORT" != 443 && "$XRAY_PORT" != 8443 ]] || die "Loopback-порт конфликтует с другим сервисом."
+fi
+if [ -n "$TUNNEL_PATH" ]; then
+  [[ "$TUNNEL_PATH" =~ ^/[a-zA-Z0-9/_-]+$ && "$TUNNEL_PATH" != / ]] || die "Путь: / и буквы, цифры, _, -; без query и пробелов."
+  case "$TUNNEL_PATH" in /health|/health/*|/.well-known/*|/assets|/assets/) die "Путь конфликтует с сайтом или health.";; esac
+fi
+[[ "$NODE_IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$ ]] || die "Некорректный образ Docker."
+[[ -z "$MEM_LIMIT" || "$MEM_LIMIT" =~ ^[1-9][0-9]*[mgMG]$ ]] || die "Лимит памяти: например 1500m или 2g."
+if [ -n "$PREVIOUS_TYPE" ] && { [ "$PREVIOUS_TYPE" != "$TYPE" ] || [ "$PREVIOUS_DOMAIN" != "$DOMAIN" ]; }; then
+  die "Смена типа/домена существующей установки требует отдельной миграции."
+fi
 WEBROOT="/var/www/${DOMAIN}"
 BRAND="$(echo "${DOMAIN%%.*}" | tr '-' ' ' | sed 's/\b\(.\)/\u\1/g')"
 
@@ -190,35 +313,63 @@ echo "  образ ноды      : $NODE_IMAGE"
 [ "$NEEDS_SITE" = 1 ] && echo "  сайт в          : $WEBROOT"
 [ "$NEEDS_CERT" = 1 ] && echo "  сертификат      : Let's Encrypt на $DOMAIN"
 [ "$NEEDS_CERT" = 0 ] && echo "  сертификат      : не нужен (Reality терминирует TLS сам)"
-confirm "Продолжать?" || die "отменено"
+if [ "$PLAN" = 1 ]; then
+  echo "План: Secret Key → DNS → пакеты/сеть/Docker/UFW → сертификат/nginx → remnanode → инструкция панели."
+  echo "Ничего не изменено. Ключ не читался."
+  exit 0
+fi
+[ "$(id -u)" -eq 0 ] || die "Запустите под root (sudo -i)."
+. /etc/os-release
+[ "${ID:-}" = ubuntu ] && [ "${VERSION_ID:-}" = 24.04 ] || die "Поддерживается Ubuntu 24.04."
+if [ -f "$NODE_DIR/docker-compose.yml" ] && [ ! -f "$STATE_DIR/settings.tsv" ]; then
+  die "Обнаружена нода, созданная другим установщиком. Автоматическая миграция не выполняется."
+fi
+if [ "$NEEDS_NGINX" = 0 ] && systemctl is-active --quiet nginx; then
+  die "nginx уже работает; этот тип требует отдельной проверки занятых портов."
+fi
+if [ "$NEEDS_NGINX" = 1 ] && [ -d /etc/nginx/sites-enabled ]; then
+  for site in /etc/nginx/sites-enabled/*; do
+    [ -e "$site" ] || continue
+    case "${site##*/}" in default|pulsar-node.conf) ;; *) die "На сервере есть чужой nginx virtual host: $site. Нужна отдельная миграция.";; esac
+  done
+fi
+log "Шаг 2/7 — ключ подключения к панели"
+read_secret
+[ "$HARDEN" = 0 ] || [ -s /root/.ssh/authorized_keys ] || die "Для --harden сначала установите SSH-ключ."
+confirm "Установить с этими параметрами?" || die "Отменено до изменений системы."
+install -d -m 700 "$STATE_DIR"
+exec 9>"$STATE_DIR/install.lock"
+flock -n 9 || die "Другой установщик уже работает."
+save_settings
+write_secret
+STEP="DNS"
+MYIP="$(curl -fsS -4 --max-time 8 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
+valid_ip "$MYIP" || die "Не удалось определить IPv4 ноды."
+
 
 ### --- DNS --------------------------------------------------------------- ###
 log "Проверяю DNS"
-resolved="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -1 || true)"
-[ -n "$resolved" ] || resolved="$(python3 -c "import socket,sys
-try: print(socket.gethostbyname(sys.argv[1]))
-except Exception: pass" "$DOMAIN")"
+resolved="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -1 || true)"
 if [ "$resolved" = "$MYIP" ]; then
   ok "$DOMAIN -> $resolved (совпадает с IP ноды)"
 else
   warn "$DOMAIN -> ${resolved:-не резолвится}, а IP ноды $MYIP"
   warn "без корректной A-записи Let's Encrypt не выдаст сертификат"
-  confirm "Всё равно продолжать?" || die "поправь DNS и запусти снова"
+  [ "$NEEDS_CERT" = 0 ] || die "Исправьте A-запись на $MYIP и повторите запуск; параметры и ключ уже сохранены."
 fi
 if [ "$TYPE" = "cdn" ] && [ -n "$CDN_DOMAIN" ]; then
-  cdnip="$(python3 -c "import socket,sys
-try: print(socket.gethostbyname(sys.argv[1]))
-except Exception: pass" "$CDN_DOMAIN")"
+  cdnip="$(getent ahostsv4 "$CDN_DOMAIN" 2>/dev/null | awk '{print $1}' | head -1 || true)"
   [ -n "$cdnip" ] && ok "$CDN_DOMAIN -> $cdnip (edge CDN)" || warn "$CDN_DOMAIN не резолвится — CDN-ресурс ещё собирается?"
 fi
 
 ### --- 1. пакеты --------------------------------------------------------- ###
-log "Обновляю пакеты и ставлю зависимости"
+STEP="пакеты и сеть"
+log "Шаг 3/7 — пакеты, сеть и Docker"
 apt-get update -qq
-apt-get -y -qq upgrade
-apt-get -y -qq install curl ca-certificates gnupg jq ufw nginx certbot \
-                       unattended-upgrades openssl python3
-ok "nginx $(nginx -v 2>&1 | grep -oE '[0-9.]+' | head -1), certbot $(certbot --version 2>&1 | awk '{print $2}')"
+if [ "$UPGRADE" = 1 ]; then apt-get -y -qq upgrade; fi
+apt-get -y -qq install curl ca-certificates gnupg jq ufw openssl python3
+[ "$NEEDS_CERT" = 0 ] || apt-get -y -qq install certbot
+[ "$NEEDS_NGINX" = 0 ] || apt-get -y -qq install nginx
 
 ### --- 2. swap ----------------------------------------------------------- ###
 log "swap"
@@ -265,18 +416,20 @@ else
   apt-get -y -qq install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   ok "поставлен $(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
 fi
-mkdir -p /etc/docker
-cat > /etc/docker/daemon.json <<'EOF'
-{ "log-driver": "json-file", "log-opts": { "max-size": "10m", "max-file": "3" } }
-EOF
-systemctl restart docker
+# Rotation is scoped to the node compose file; preserve daemon.json and other containers.
+systemctl enable --now docker
+docker compose version >/dev/null || die "Нужен Docker Compose plugin."
 
 ### --- 5. ufw ------------------------------------------------------------ ###
-log "ufw ($NODE_PORT — только с панели $PANEL_IP)"
-ufw --force reset >/dev/null
+STEP="firewall"
+log "Шаг 4/7 — firewall ($NODE_PORT только с $PANEL_IP); существующие правила сохраняются"
 ufw default deny incoming  >/dev/null
 ufw default allow outgoing >/dev/null
-ufw allow 22/tcp  >/dev/null
+SSH_PORT="${SSH_CONNECTION:-}"
+SSH_PORT="${SSH_PORT##* }"
+SSH_PORT="${SSH_PORT:-22}"
+valid_port "$SSH_PORT" || die "Не удалось определить SSH-порт."
+ufw allow "$SSH_PORT/tcp" >/dev/null
 ufw allow 80/tcp  >/dev/null
 ufw allow 443/tcp >/dev/null
 [ "$TYPE" = "hysteria" ] && ufw allow 443/udp >/dev/null   # Hysteria2 — UDP
@@ -286,8 +439,10 @@ ufw status | sed 's/^/    /'
 
 ### --- 6. сайт-прикрытие ------------------------------------------------- ###
 if [ "$NEEDS_SITE" = 1 ]; then
+(
+umask 022
 log "Сайт-прикрытие в $WEBROOT"
-mkdir -p "$WEBROOT/assets" /var/www/certbot
+install -d -m 755 "$WEBROOT" "$WEBROOT/assets" /var/www/certbot
 if [ -f "$WEBROOT/index.html" ]; then
   ok "index.html уже есть — не перезаписываю (свой сайт сохраняется)"
 else
@@ -406,14 +561,17 @@ EOF
   ok "сгенерирован сайт: $(ls "$WEBROOT" | wc -l) файлов + $(ls "$WEBROOT/assets" | wc -l) ассетов"
   warn "это болванка — при желании замени файлы в $WEBROOT на свой сайт"
 fi
+)
 fi  # NEEDS_SITE
 
 ### --- 7. сертификат ----------------------------------------------------- ###
 if [ "$NEEDS_CERT" = 1 ]; then
-log "Сертификат Let's Encrypt для $DOMAIN"
-mkdir -p /var/www/certbot
+STEP="сертификат и nginx"
+log "Шаг 5/7 — сертификат и nginx для $DOMAIN"
+install -d -m 755 /var/www/certbot
 if [ "$NEEDS_NGINX" = 1 ]; then
   # cdn/selfsteal: nginx уже нужен — выпускаем через webroot
+  if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
   rm -f /etc/nginx/sites-enabled/default
   cat > /etc/nginx/sites-available/pulsar-node.conf <<EOF
 server {
@@ -426,11 +584,12 @@ server {
 EOF
   ln -sfn /etc/nginx/sites-available/pulsar-node.conf /etc/nginx/sites-enabled/pulsar-node.conf
   nginx -t >/dev/null 2>&1 || die "nginx -t не прошёл на минимальном конфиге"
+  systemctl start nginx
   systemctl reload nginx
+  fi
   CERTBOT_MODE="--webroot -w /var/www/certbot"
 else
   # hysteria: постоянный nginx не нужен — выпускаем в standalone-режиме
-  systemctl stop nginx 2>/dev/null || true
   CERTBOT_MODE="--standalone"
 fi
 
@@ -442,43 +601,35 @@ else
     || die "certbot не смог выдать сертификат — проверь A-запись и что порт 80 открыт"
   ok "выдан"
 fi
-mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
 if [ "$NEEDS_NGINX" = 1 ]; then
-  printf '#!/bin/sh\nsystemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+  printf '#!/bin/sh\nnginx -t && systemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/pulsar-node-renew.sh
 else
   # hysteria: продление в standalone, после — перезапустить ноду, чтобы xray
   # подхватил новый серт (Remnawave монтирует /etc/letsencrypt в контейнер).
-  printf '#!/bin/sh\ncd /opt/remnanode && docker compose restart >/dev/null 2>&1 || true\n' \
-    > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+  printf '#!/bin/sh\ncd /opt/remnanode && docker compose restart remnanode\n' \
+    > /etc/letsencrypt/renewal-hooks/deploy/pulsar-node-renew.sh
 fi
-chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
-systemctl enable certbot.timer >/dev/null 2>&1 || true
+chmod 700 /etc/letsencrypt/renewal-hooks/deploy/pulsar-node-renew.sh
+systemctl enable --now certbot.timer
 ok "автопродление: $(systemctl is-enabled certbot.timer 2>/dev/null || echo '?')"
 fi  # NEEDS_CERT
 
 ### --- 8. nginx под тип ноды --------------------------------------------- ###
 if [ "$NEEDS_NGINX" = 1 ]; then
 if [ "$TYPE" = "cdn" ]; then
-  # CDN гонит много коротких uplink-GET → дефолтные 768 соединений малы,
-  # под нагрузкой упираемся в них (волна 500-х). Поднимаем воркеры.
-  if ! grep -q 'pulsar-node-tuning' /etc/nginx/nginx.conf; then
-    install -d /etc/nginx/conf.d
-    sed -i 's/^\(\s*\)worker_connections .*/\1worker_connections 16384;\n\1multi_accept on;/' /etc/nginx/nginx.conf 2>/dev/null || true
-    grep -q 'worker_rlimit_nofile' /etc/nginx/nginx.conf || \
-      sed -i '1i worker_rlimit_nofile 65535;  # pulsar-node-tuning' /etc/nginx/nginx.conf
-    grep -q 'pulsar-node-tuning' /etc/nginx/nginx.conf || \
-      sed -i '1i # pulsar-node-tuning' /etc/nginx/nginx.conf
-  fi
+  # Keep global nginx limits intact; tune only this virtual host.
   log "nginx: origin для CDN (443 у nginx, туннель $TUNNEL_PATH -> 127.0.0.1:$XRAY_PORT)"
-  cat > /etc/nginx/sites-available/pulsar-node.conf <<EOF
+  NGINX_CANDIDATE=$(mktemp /etc/nginx/sites-available/pulsar-node.XXXXXX)
+  cat > "$NGINX_CANDIDATE" <<EOF
 # --- Origin для российского CDN ------------------------------------------
 # Клиент -> $CDN_DOMAIN (edge CDN) -> сюда ($DOMAIN:443) -> xray на loopback.
 # Всё, кроме секретного пути, отдаётся как обычный сайт.
 upstream xray_backend {
     server 127.0.0.1:$XRAY_PORT;
-    keepalive 512;
-    keepalive_requests 100000;
-    keepalive_timeout 300s;
+    keepalive 64;
+    keepalive_requests 1000;
+    keepalive_timeout 75s;
 }
 
 server {
@@ -497,10 +648,14 @@ server {
     ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:PulsarTLS:10m;
+    ssl_session_timeout 1d;
+    large_client_header_buffers 4 32k;
+    gzip off;
 
     # edge держит соединения долго — не рвём их каждые 1000 запросов
-    keepalive_timeout 300s;
-    keepalive_requests 100000;
+    keepalive_timeout 75s;
+    keepalive_requests 1000;
 
     root  $WEBROOT;
     index index.html;
@@ -512,9 +667,11 @@ server {
         access_log off;
     }
 
-    location ^~ $TUNNEL_PATH {
-        # некоторые CDN срезают хвостовой слэш, а xhttp-инбаунд его ждёт
-        rewrite ^${TUNNEL_PATH%/}\$ $TUNNEL_PATH break;
+    # Match the exact endpoint AND subpaths, without an HTTP redirect.
+    location = ${TUNNEL_PATH%/} {
+        rewrite ^ ${TUNNEL_PATH%/}/ last;
+    }
+    location ^~ ${TUNNEL_PATH%/}/ {
 
         client_max_body_size 0;
         if (\$request_method = HEAD) { return 204; }
@@ -531,6 +688,8 @@ server {
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_cache off;
+        proxy_next_upstream off;
+        gzip off;
         proxy_socket_keepalive on;
 
         proxy_connect_timeout 10s;
@@ -543,7 +702,7 @@ server {
         add_header Cache-Control "no-store, no-cache, no-transform, max-age=0" always;
         add_header Pragma "no-cache" always;
 
-        access_log /var/log/nginx/tunnel_access.log;
+        access_log off; # Tunnel paths/session metadata do not belong in access logs.
     }
 
     location ^~ /assets/ { expires 7d; add_header Cache-Control "public"; }
@@ -555,7 +714,8 @@ server {
 EOF
 else
   log "nginx: сайт только на 127.0.0.1:$SELFSTEAL_SITE_PORT (443 займёт xray)"
-  cat > /etc/nginx/sites-available/pulsar-node.conf <<EOF
+  NGINX_CANDIDATE=$(mktemp /etc/nginx/sites-available/pulsar-node.XXXXXX)
+  cat > "$NGINX_CANDIDATE" <<EOF
 # --- Сайт-прикрытие для Reality (target = 127.0.0.1:$SELFSTEAL_SITE_PORT) ---
 # Публичный 443 занимает xray. Reality сам терминирует TLS для своих клиентов,
 # а всех остальных (браузеры, активные пробы) прозрачно отдаёт сюда.
@@ -594,18 +754,30 @@ server {
 }
 EOF
 fi
-nginx -t || die "nginx -t не прошёл, конфиг не применён (старый остался рабочим)"
-systemctl enable nginx >/dev/null 2>&1 || true
-systemctl restart nginx
-ok "nginx перезагружен"
+NGINX_CONFIG=/etc/nginx/sites-available/pulsar-node.conf
+NGINX_BACKUP="$STATE_DIR/nginx-before-$(date -u +%Y%m%dT%H%M%SZ).conf"
+had_config=0
+if [ -f "$NGINX_CONFIG" ]; then cp -p "$NGINX_CONFIG" "$NGINX_BACKUP"; had_config=1; fi
+chmod 644 "$NGINX_CANDIDATE"
+mv "$NGINX_CANDIDATE" "$NGINX_CONFIG"
+ln -sfn "$NGINX_CONFIG" /etc/nginx/sites-enabled/pulsar-node.conf
+if ! nginx -t; then
+  if [ "$had_config" = 1 ]; then cp -p "$NGINX_BACKUP" "$NGINX_CONFIG"; else rm -f /etc/nginx/sites-enabled/pulsar-node.conf "$NGINX_CONFIG"; fi
+  die "nginx -t отклонил конфигурацию; предыдущий файл восстановлен."
+fi
+systemctl enable --now nginx
+if ! systemctl reload nginx; then
+  if [ "$had_config" = 1 ]; then cp -p "$NGINX_BACKUP" "$NGINX_CONFIG"; nginx -t && systemctl reload nginx; fi
+  die "Reload nginx завершился ошибкой."
+fi
+ok "nginx проверен и перечитал конфигурацию"
 else
-  # reality / hysteria: nginx на ноде не нужен, 443 занимает xray.
-  systemctl disable --now nginx >/dev/null 2>&1 || true
-  ok "nginx не используется для типа $TYPE (443 займёт xray)"
+  ok "nginx для $TYPE не устанавливается"
 fi  # NEEDS_NGINX
 
 ### --- 9. remnanode ------------------------------------------------------ ###
-log "remnanode"
+STEP="remnanode"
+log "Шаг 6/7 — запуск remnanode"
 mkdir -p /opt/remnanode && chmod 700 /opt/remnanode
 
 # Лимит памяти контейнеру: если xray потечёт, docker убьёт и перезапустит
@@ -616,6 +788,9 @@ if [ -z "$MEM_LIMIT" ]; then
 fi
 ok "лимит памяти контейнера: $MEM_LIMIT (RAM ноды: $(free -m | awk '/^Mem:/{print $2}') MB)"
 
+if [ -f /opt/remnanode/docker-compose.yml ]; then
+  cp -p /opt/remnanode/docker-compose.yml "$STATE_DIR/compose-before-$(date -u +%Y%m%dT%H%M%SZ).yml"
+fi
 cat > /opt/remnanode/docker-compose.yml <<EOF
 services:
   remnanode:
@@ -637,47 +812,35 @@ services:
 EOF
 ok "compose записан (образ $NODE_IMAGE)"
 
-if [ ! -s /opt/remnanode/.env ] || ! grep -q '^SECRET_KEY' /opt/remnanode/.env; then
-  cat <<EOF
-
-──────────────────────────────────────────────────────────────────────────
-Не хватает /opt/remnanode/.env с ключом панели (SECRET_KEY).
-
-Где взять ключ:
-  • если у тебя УЖЕ есть ноды в этой панели — скопируй .env с любой живой:
-      scp -3 root@<живая-нода>:/opt/remnanode/.env root@$MYIP:/opt/remnanode/.env
-  • если это ПЕРВАЯ нода — ключ показывается в панели при создании ноды
-    (Remnawave → Nodes → создать → там будет SECRET_KEY).
-
-ВАЖНО: НЕ брать ключ из GET /api/keygen — он отдаёт другой (ротируемый) ключ,
-нода с ним к панели не подключится.
-
-Либо создай файл вручную (порт совпадает с тем, что ждёт панель):
-  printf 'NODE_PORT=$NODE_PORT\nSECRET_KEY=<ключ>\n' > /opt/remnanode/.env && chmod 600 /opt/remnanode/.env
-
-Затем запусти этот скрипт ещё раз — он продолжит с этого места.
-──────────────────────────────────────────────────────────────────────────
-EOF
-  exit 0
-fi
-chmod 600 /opt/remnanode/.env
-grep -q '^NODE_PORT' /opt/remnanode/.env || echo "NODE_PORT=$NODE_PORT" >> /opt/remnanode/.env
 cd /opt/remnanode
-docker compose up -d >/dev/null 2>&1 || docker compose up -d
-sleep 8
+docker compose config --quiet
+docker compose up -d --pull missing
+for attempt in $(seq 1 30); do
+  [ -n "$(ss -H -ltn "sport = :$NODE_PORT")" ] && break
+  sleep 2
+ done
 docker ps --format '    {{.Names}} {{.Image}} {{.Status}}' | grep remnanode || warn "контейнер не поднялся, смотри docker logs remnanode"
-ss -ltn | grep -q ":$NODE_PORT" && ok "порт $NODE_PORT слушает (снаружи открыт только для $PANEL_IP)" \
-                                || warn "порт $NODE_PORT не слушает"
+[ -n "$(ss -H -ltn "sport = :$NODE_PORT")" ] && ok "порт $NODE_PORT слушает; правило доступа панели $PANEL_IP добавлено" \
+                                || die "Порт $NODE_PORT не слушает. Проверьте docker logs remnanode; ключ и параметры сохранены."
 
 ### --- 10. опциональное закручивание SSH -------------------------------- ###
 if [ "$HARDEN" = 1 ]; then
   log "Отключаю вход по паролю"
-  keys="$(grep -cE '^(ssh|ecdsa)-' /root/.ssh/authorized_keys 2>/dev/null || echo 0)"
+  keys="$(grep -cE '^(ssh|ecdsa)-' /root/.ssh/authorized_keys 2>/dev/null || true)"
+  keys="${keys:-0}"
   if [ "$keys" -ge 1 ]; then
     install -d -m 755 /etc/ssh/sshd_config.d
+    SSH_BACKUP="$STATE_DIR/sshd-before.conf"
+    had_ssh_config=0
+    if [ -f /etc/ssh/sshd_config.d/10-pulsar.conf ]; then cp -p /etc/ssh/sshd_config.d/10-pulsar.conf "$SSH_BACKUP"; had_ssh_config=1; fi
     printf 'PubkeyAuthentication yes\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
       > /etc/ssh/sshd_config.d/10-pulsar.conf
-    sshd -t && { systemctl reload ssh 2>/dev/null || systemctl restart ssh; ok "пароли выключены ($keys ключ(а) в authorized_keys)"; }
+    if ! sshd -t; then
+      if [ "$had_ssh_config" = 1 ]; then cp -p "$SSH_BACKUP" /etc/ssh/sshd_config.d/10-pulsar.conf; else rm -f /etc/ssh/sshd_config.d/10-pulsar.conf; fi
+      die "sshd -t не прошёл; конфигурация SSH восстановлена."
+    fi
+    systemctl reload ssh
+    ok "пароли выключены ($keys ключ(а) в authorized_keys)"
   else
     warn "в authorized_keys нет ключей — пароли НЕ выключаю, иначе потеряешь доступ"
   fi
@@ -696,17 +859,18 @@ if [ "$TYPE" = "reality" ]; then
     echo "  проверяю кандидатов (TLS1.3 + h2 + валидный серт):"
     BEST=""
     for d in $CANDIDATES; do
-      out="$(echo | timeout 8 openssl s_client -connect "$d:443" -servername "$d" -tls1_3 -alpn h2 2>/dev/null)"
-      tls=$(echo "$out" | grep -c "TLSv1.3")
-      alpn=$(echo "$out" | grep -c "ALPN protocol: h2")
-      ver=$(echo "$out" | grep -c "Verify return code: 0")
+      out="$(echo | timeout 8 openssl s_client -connect "$d:443" -servername "$d" -tls1_3 -alpn h2 2>/dev/null || true)"
+      tls=$(echo "$out" | grep -c "TLSv1.3" || true)
+      alpn=$(echo "$out" | grep -c "ALPN protocol: h2" || true)
+      ver=$(echo "$out" | grep -c "Verify return code: 0" || true)
       if [ "$tls" -ge 1 ] && [ "$alpn" -ge 1 ] && [ "$ver" -ge 1 ]; then
         printf '    %-22s OK\n' "$d"; [ -z "$BEST" ] && BEST="$d"
       else
         printf '    %-22s пропуск\n' "$d"
       fi
     done
-    SNI="${BEST:-www.icloud.com}"
+    [ -n "$BEST" ] || die "Ни один SNI не прошёл проверку; задайте --sni после проверки вручную."
+    SNI="$BEST"
     ok "рекомендую SNI: $SNI  (можно задать свой через --sni)"
   fi
 fi
@@ -717,20 +881,28 @@ fi
 REALITY_PRIV=""; REALITY_PUB=""; SHORT_ID=""
 if [ "$TYPE" = "reality" ] || [ "$TYPE" = "selfsteal" ]; then
   log "Генерирую ключи Reality (свои для этой ноды)"
-  kp="$(docker exec remnanode xray x25519 2>/dev/null || true)"
+  if [ -s "$STATE_DIR/reality.keys" ]; then
+    kp="$(cat "$STATE_DIR/reality.keys")"
+  else
+    kp="$(docker exec remnanode xray x25519)"
+    printf '%s\n' "$kp" > "$STATE_DIR/reality.keys"
+    chmod 600 "$STATE_DIR/reality.keys"
+  fi
   REALITY_PRIV="$(printf '%s\n' "$kp" | awk -F': ' '/PrivateKey|Private key/{print $2; exit}')"
   REALITY_PUB="$(printf '%s\n' "$kp" | awk -F': ' '/Password|Public key|PublicKey/{print $2; exit}')"
-  SHORT_ID="$(openssl rand -hex 8)"
+  [ -s "$STATE_DIR/reality.shortid" ] || openssl rand -hex 8 > "$STATE_DIR/reality.shortid"
+  SHORT_ID="$(cat "$STATE_DIR/reality.shortid")"
   if [ -n "$REALITY_PRIV" ] && [ -n "$REALITY_PUB" ]; then
-    ok "ключи сгенерированы"
+    ok "Reality-ключи готовы (повторный запуск сохраняет прежние)"
   else
-    warn "не удалось сгенерировать через контейнер — сгенери вручную:"
-    warn "  docker exec remnanode xray x25519   и   openssl rand -hex 8"
+    die "Не удалось прочитать Reality-ключи. Проверьте версию Xray и $STATE_DIR/reality.keys."
   fi
 fi
 
 ### --- 11. проверки и итог ---------------------------------------------- ###
-log "Проверки"
+STEP="проверки"
+log "Шаг 7/7 — проверки и передача параметров в панель"
+save_settings
 case "$TYPE" in
   cdn)
     printf '    сайт (origin)  = %s\n' "$(curl -sk --resolve "$DOMAIN:443:127.0.0.1" -o /dev/null -w '%{http_code}' "https://$DOMAIN/")"
@@ -770,8 +942,7 @@ EOF
 cat <<EOF
 
 Что создать в панели:
-  1) Node   — адрес $MYIP, порт $NODE_PORT.
-  2) Config profile + inbound — по типу:
+  1) Config profile + inbound — по типу:
 $(case "$TYPE" in
   cdn)       echo "       vless + xhttp, listen 127.0.0.1:$XRAY_PORT, path $TUNNEL_PATH,";
              echo "       security none (TLS терминирует nginx/CDN). Host: $CDN_DOMAIN, fp=edge.";;
@@ -782,7 +953,8 @@ $(case "$TYPE" in
   hysteria)  echo "       hysteria2, listen 0.0.0.0:443 (UDP), TLS-серт";
              echo "       /etc/letsencrypt/live/$DOMAIN/ (примонтирован в контейнер).";;
 esac)
-  3) Host — адрес подключения клиента, fingerprint edge.
+  2) Node — адрес $MYIP, порт $NODE_PORT; назначь профиль и его inbound.
+  3) Host — адрес подключения клиента, fingerprint edge (для Hysteria не нужен).
   4) Добавь inbound в сквод — ИНАЧЕ панель не отдаст его на ноду и порт
      $([ "$TYPE" = cdn ] && echo "$XRAY_PORT" || echo 443) не откроется.
 ────────────────────────────────────────────────────────────────────────
@@ -790,7 +962,7 @@ EOF
 
 # --- готовые значения и JSON для панели -----------------------------------
 if [ "$TYPE" = "reality" ]; then
-  cat <<EOF
+  cat > "$STATE_DIR/panel-reality.txt" <<EOF
 
 ════════════════ ДАННЫЕ ДЛЯ ПАНЕЛИ (VLESS Reality) ════════════════════════
   privateKey (в inbound) : $REALITY_PRIV
@@ -823,7 +995,7 @@ if [ "$TYPE" = "reality" ]; then
 ═══════════════════════════════════════════════════════════════════════════
 EOF
 elif [ "$TYPE" = "selfsteal" ]; then
-  cat <<EOF
+  cat > "$STATE_DIR/panel-reality.txt" <<EOF
 
 ════════════════ ДАННЫЕ ДЛЯ ПАНЕЛИ (VLESS Reality self-steal) ═════════════
   privateKey (в inbound) : $REALITY_PRIV
@@ -833,7 +1005,7 @@ elif [ "$TYPE" = "selfsteal" ]; then
   Reality target         : 127.0.0.1:$SELFSTEAL_SITE_PORT (локальный сайт)
   адрес подключения (Host): $DOMAIN : 443, fingerprint edge
 
-── JSON инбаунда (транспорт raw; xhttp можно включить в панели позже) ──────
+── JSON инбаунда (XHTTP Reality со своим сайтом) ──────
 {
   "tag": "SELFSTEAL_$(echo "$DOMAIN" | tr '.:' '__')",
   "listen": "0.0.0.0",
@@ -841,7 +1013,8 @@ elif [ "$TYPE" = "selfsteal" ]; then
   "protocol": "vless",
   "settings": { "clients": [], "decryption": "none" },
   "streamSettings": {
-    "network": "raw",
+    "network": "xhttp",
+    "xhttpSettings": { "mode": "auto", "path": "$TUNNEL_PATH" },
     "security": "reality",
     "realitySettings": {
       "target": "127.0.0.1:$SELFSTEAL_SITE_PORT",
@@ -859,4 +1032,9 @@ EOF
 fi
 
 echo
-warn "privateKey — секрет: он остаётся только в панели, клиентам идёт publicKey."
+if [ -f "$STATE_DIR/panel-reality.txt" ]; then
+  chmod 600 "$STATE_DIR/panel-reality.txt"
+  echo "JSON с Reality-ключом сохранён: $STATE_DIR/panel-reality.txt (root only)."
+  echo "Откройте его локально на VPS и перенесите inbound в панель. Не публикуйте файл."
+fi
+echo "Подготовка завершена. VPN заработает после настройки профиля, Host и сквода в панели."

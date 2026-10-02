@@ -185,6 +185,99 @@ write_secret() {
   chmod 600 "$tmp"; mv "$tmp" "$NODE_DIR/.env"
   unset SECRET_KEY
 }
+write_cdn_panel_files() {
+  install -d -m 700 "$STATE_DIR"
+  cat > "$STATE_DIR/panel-cdn-inbound.json" <<EOF
+{
+  "tag": "CDN_$(echo "$DOMAIN" | tr '.:' '__')",
+  "listen": "127.0.0.1",
+  "port": $XRAY_PORT,
+  "protocol": "vless",
+  "settings": {
+    "clients": [],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "xhttp",
+    "security": "none",
+    "xhttpSettings": {
+      "mode": "packet-up",
+      "path": "$TUNNEL_PATH",
+      "noSSEHeader": false,
+      "xPaddingKey": "_dc",
+      "noGRPCHeader": true,
+      "uplinkDataKey": "stream",
+      "xPaddingBytes": "100-1000",
+      "xPaddingHeader": "X-Cache",
+      "xPaddingMethod": "tokenish",
+      "uplinkHTTPMethod": "GET",
+      "xPaddingObfsMode": true,
+      "xPaddingPlacement": "header",
+      "scMaxBufferedPosts": 10,
+      "scMaxEachPostBytes": 24000,
+      "uplinkDataPlacement": "header",
+      "uplinkChunkSize": 3000,
+      "scMinPostsIntervalMs": 10,
+      "scStreamUpServerSecs": "20-80",
+      "serverMaxHeaderBytes": 65536
+    }
+  },
+  "sniffing": {
+    "enabled": false
+  }
+}
+EOF
+  chmod 600 "$STATE_DIR/panel-cdn-inbound.json"
+  cat > "$STATE_DIR/panel-cdn-host-extra.json" <<EOF
+{
+  "mode": "packet-up",
+  "path": "$TUNNEL_PATH",
+  "noSSEHeader": false,
+  "xPaddingKey": "_dc",
+  "noGRPCHeader": true,
+  "uplinkDataKey": "stream",
+  "xPaddingBytes": "100-1000",
+  "xPaddingHeader": "X-Cache",
+  "xPaddingMethod": "tokenish",
+  "uplinkHTTPMethod": "GET",
+  "xPaddingObfsMode": true,
+  "xPaddingPlacement": "header",
+  "scMaxBufferedPosts": 10,
+  "scMaxEachPostBytes": 24000,
+  "uplinkDataPlacement": "header",
+  "uplinkChunkSize": 3000,
+  "scMinPostsIntervalMs": 10,
+  "scStreamUpServerSecs": "20-80",
+  "serverMaxHeaderBytes": 65536,
+  "xmux": {
+    "cMaxReuseTimes": 0,
+    "maxConcurrency": "0",
+    "maxConnections": 2,
+    "hKeepAlivePeriod": 0,
+    "hMaxRequestTimes": "100-200",
+    "hMaxReusableSecs": "300-600"
+  }
+}
+EOF
+  chmod 600 "$STATE_DIR/panel-cdn-host-extra.json"
+  cat > "$STATE_DIR/panel-cdn.txt" <<EOF
+CDN: настройка в панели после установки
+1. Config Profile: добавьте объект из $STATE_DIR/panel-cdn-inbound.json
+   в массив inbounds (это не полный профиль).
+2. Назначьте профиль и inbound ноде и добавьте inbound в нужный сквод.
+3. Host: адрес / SNI / HTTP Host = $CDN_DOMAIN, порт 443, security TLS,
+   fingerprint edge, ALPN h2,http/1.1, path $TUNNEL_PATH.
+   XHTTP Extra Params: вставьте $STATE_DIR/panel-cdn-host-extra.json целиком.
+4. CDN: origin $DOMAIN по HTTPS:443, Host/SNI origin $DOMAIN;
+   отключите кэширование пути $TUNNEL_PATH в настройках CDN.
+5. Обновите подписку клиента, переподключитесь и проверьте отправку файла.
+Нужны оба JSON: большой пакет в Host снова сломает upload через заголовки.
+Параметры проверены на Xray 26.7.28 и Yandex CDN; клиент должен поддерживать
+GET/header XHTTP. Другие CDN требуют отдельной проверки.
+EOF
+  chmod 600 "$STATE_DIR/panel-cdn.txt"
+}
+
 # Tests can source helpers without touching the host.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 load_settings
@@ -650,10 +743,11 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:PulsarTLS:10m;
     ssl_session_timeout 1d;
-    large_client_header_buffers 4 32k;
+    # 24 KB payload becomes 32 KB Base64, plus metadata.
+    large_client_header_buffers 4 16k;
     gzip off;
 
-    # edge держит соединения долго — не рвём их каждые 1000 запросов
+    # Ограничиваем время и число запросов keepalive-соединения
     keepalive_timeout 75s;
     keepalive_requests 1000;
 
@@ -961,6 +1055,10 @@ esac)
 EOF
 
 # --- готовые значения и JSON для панели -----------------------------------
+if [ "$TYPE" = "cdn" ]; then
+  write_cdn_panel_files
+  cat "$STATE_DIR/panel-cdn.txt"
+fi
 if [ "$TYPE" = "reality" ]; then
   cat > "$STATE_DIR/panel-reality.txt" <<EOF
 

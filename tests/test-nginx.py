@@ -87,6 +87,11 @@ with tempfile.TemporaryDirectory(prefix='pulsar-nginx-test-') as directory:
                             assert 'Content-Encoding' not in headers
                             assert 'no-store' in headers.get('Cache-Control', '')
                         assert request('/stream/session/1?offset=3')[1].startswith('/stream/session/1?offset=3:')
+                        # Full 24 KB raw packet encoded into header fields plus padding.
+                        payload = {f'stream-{i}':'a'*min(3000,32000-start)
+                                   for i,start in enumerate(range(0,32000,3000))}
+                        payload['X-Cache'] = 'p'*1000
+                        assert request('/stream/session/2', payload)[0] == 200
                         assert request('/health')[0] == 200
                         assert request('/stream-other')[0] == 404
                     print('PASS nginx:', 'cdn '+path if index == 0 else 'selfsteal TLS site')

@@ -46,6 +46,23 @@ save_settings
 TYPE=''; DOMAIN=''; load_settings
 [ "$TYPE" = cdn ] && [ "$DOMAIN" = node.example.com ] || fail 'resume settings'
 if bash ./new-node.sh --plan --yes --type selfsteal >/dev/null 2>&1; then fail 'silent type conversion'; fi
+# Render actual panel artifacts and check client/server agreement.
+write_cdn_panel_files
+python3 - "$STATE_DIR" <<'PY'
+import json,sys
+from pathlib import Path
+p=Path(sys.argv[1])
+i=json.loads((p/'panel-cdn-inbound.json').read_text())
+h=json.loads((p/'panel-cdn-host-extra.json').read_text())
+x=i['streamSettings']['xhttpSettings']
+assert i['listen']=='127.0.0.1' and i['port']==4444
+assert {k:v for k,v in h.items() if k!='xmux'}==x
+assert x['path']=='/stream/' and x['uplinkHTTPMethod']=='GET'
+assert x['uplinkDataPlacement']=='header'
+assert x['scMaxEachPostBytes']*4//3+4096 < x['serverMaxHeaderBytes']
+assert x['uplinkChunkSize'] < 8192
+assert 'fixture-' not in (p/'panel-cdn-inbound.json').read_text()
+PY
 # Ensure no deployment routine ran: only helper state exists under scratch.
 bash -n new-node.sh
 bash -n bootstrap-node-access.sh
